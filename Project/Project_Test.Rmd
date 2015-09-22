@@ -1,0 +1,185 @@
+---
+title: "Untitled"
+author: "Jerry Kurata"
+date: "September 22, 2015"
+output: html_document
+---
+
+## Load required packages
+```{r Load packages}
+require(data.table)
+require(caret)
+require(e1071)
+require(randomForest)
+require(parallel)
+require(doparallel)
+```
+
+
+## Load data files
+```{r Load datafiles }
+setInternet2(TRUE)
+
+url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+D <- fread(url)
+
+url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+DTest <- fread(url)
+```
+
+
+
+## Eliminate predictors with NA or "" values in the test data
+```{r eliminate predictors with NA or "" values}
+isAnyMissing <- sapply(DTest, function (x) any(is.na(x) | x == ""))
+isPredictor <- !isAnyMissing & grepl("belt|[^(fore)]arm|dumbbell|forearm", names(isAnyMissing))
+predCandidates <- names(isAnyMissing)[isPredictor]
+predCandidates
+```
+
+## create training data tables with only valid columns
+```{r subset training columns }
+varToInclude <- c("classe", predCandidates)
+D <- D[, varToInclude, with=FALSE]
+# make classe a factor
+D <- D[, classe := factor(D[, classe])]
+D[, .N, classe]
+dim(D)
+names(D)
+```
+
+##  split 60/40 training/test datasets
+```{r split into training and test datasets}
+require(caret)
+set.seed(160615)   # start date as seed
+inTrain <- createDataPartition(D$classe, p=0.6)
+DTrain <- D[inTrain[[1]]]
+DProbe <- D[-inTrain[[1]]]
+```
+
+## Preprocess training dataset
+```{r Preprocess training dataset}
+X <- DTrain[, predCandidates, with=FALSE]
+preProc <- preProcess(X)
+preProc
+XCS <- predict(preProc, X)
+DTrainCS <- data.table(data.frame(classe = DTrain[, classe], XCS))
+```
+
+## preprocess test dataset
+```{r preprocess test dataset}
+X <- DProbe[, predCandidates, with=FALSE]
+XCS <- predict(preProc, X)
+DProbeCS <- data.table(data.frame(classe = DProbe[, classe], XCS))
+```
+
+## Check for unique predictors
+
+Check to see if there are predictors with near 0 variance indicating that 
+predictors that have near 0 variance which means they are duplicate
+and should be removed  
+See http://www.r-bloggers.com/near-zero-variance-predictors-should-we-remove-them/
+```{r check near 0 variance}
+nzvPredictors <- nearZeroVar(DTrainCS, saveMetrics=TRUE)
+if (any(nzvPredictors$nzv)) {
+  nzvPredictors 
+} else  {
+  message("No near 0 variance predictors.  Good to go!!")
+}
+```
+
+## Examime the predictors - REMOVE THIS!!!
+
+```{r examing predictors}
+histGroup <- function (data, regex) {
+  col <- grep(regex, names(data))
+  col <- c(col, which(names(data) == "classe"))
+  require(reshape2)
+  n <- nrow(data)
+  DMelted <- melt(data[, col, with=FALSE][, rownum := seq(1, n)], id.vars=c("rownum", "classe"))
+  require(ggplot2)
+  ggplot(DMelted, aes(x=classe, y=value)) +
+    geom_violin(aes(color=classe, fill=classe), alpha=1/2) +
+    facet_wrap(~ variable, scale="free_y") +
+    scale_color_brewer(palette="Spectral") +
+    scale_fill_brewer(palette="Spectral") +
+    labs(x="", y="") +
+    theme(legend.position="none")
+}
+histGroup(DTrainCS, "belt")
+histGroup(DTrainCS, "[^(fore)]arm")
+histGroup(DTrainCS, "dumbbell")
+histGroup(DTrainCS, "forearm")
+```
+
+
+## Train the model
+
+Enable Parallel clustering (assumes mutliple cores)
+```{r Train Model}
+# Enable parallel processing to make training faster
+require(parallel)
+require(doParallel)
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+```
+Train the model
+```{r train the model}
+system.time( trainingModel  <- train(classe ~ ., data=DTrainCS, method="rf"))
+```
+Terminate parallel processing
+```{r terminate parallel}
+stopCluster(cl)
+```
+
+## Save the training model to disk
+Since it takes a long time to build this training model, we save it to disk so we can by pass the training steps if we want.
+```{r Write training model to disk}
+trainingFile <- "trainingModel.Rdata"
+save(trainingModel, file=trainingFile)
+```
+
+#Restore training model from disk
+```{r load training model from file }
+load(trainingFile)
+```
+
+
+## Evaluate the model on training set  ?? REMOVE
+```{r evaluate mode vs training set }
+hatTrain <- predict(trainingModel, DTrainCS)
+confusionMatrix(hatTrain, DTrain[, classe])
+```
+
+## Evaluate the model on test set  ?? REMOVE
+```{r evaluate mode vs test set }
+hatTrain <- predict(trainingModel, DProbeCS)
+confusionMatrix(hatTrain, DProbeCS[, classe])
+```
+
+## Display Model
+```{r Display Model}
+varImp(trainingModel)
+trainingModel$finalModel
+```
+
+## Predict with test data 
+```{r Predict with test data}
+DTestCS <- predict(preProc, DTest[, predCandidates, with=FALSE])
+hat <- predict(trainingModel, DTestCS)
+DTest <- cbind(hat , DTest)
+subset(DTest, select=names(DTest)[grep("belt|[^(fore)]arm|dumbbell|forearm", names(DTest), invert=TRUE)])
+```
+
+```{r write answer files}
+# Write submission answer files to send to Coursera
+pml_write_files = function(x){
+  n = length(x)
+  path <- "./answers"
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=file.path(path, filename),quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+pml_write_files(hat)
+```
