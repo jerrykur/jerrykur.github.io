@@ -1,0 +1,205 @@
+---
+title: "PRactical Machine Learning Project"
+author: "Jerry"
+date: "September 22, 2015"
+output: html_document
+---
+
+# Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset). 
+
+# Analysis
+
+## Load required packages
+```{r Load packages}
+require(data.table)
+require(caret)
+require(e1071)
+require(randomForest)
+require(parallel)
+require(doParallel)
+```
+
+
+## Load data files
+Read in the files.  Convert excel div 0, nulls, and null string to NAs
+
+
+```{r Load datafiles }
+setInternet2(TRUE)
+
+url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+origTraining <- fread(url, na.strings = c("NA","#DIV/0!", ""))
+
+url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+DTest <- fread(url, na.strings = c("NA","#DIV/0!", ""))
+```
+
+# Data Clean Up
+
+We need to clean the data before we can use it.
+
+## Eliminate predictors with NA or "" values in the test data
+
+As specified in the instructions, we only want "belt, arm, forearm, or dumbell" columns.  And of 
+these only the ones that have data in the test data set.
+```{r eliminate predictors with NA or "" values}
+isAnyMissing <- sapply(DTest, function (x) any(is.na(x) | x == ""))
+# we only care about data for the forearm, arms, dumbell, and belt and those that have values
+isPredictor <- !isAnyMissing & grepl("belt|[^(fore)]arm|dumbbell|forearm", names(isAnyMissing))
+predCandidates <- names(isAnyMissing)[isPredictor]
+#predCandidates
+```
+
+## create training datasets with only valid columns
+We subset the columns in the data sets to only include the columns from above and the "classe"" column.  Since classe has a discrete set of values we make the classe column a factor.
+```{r subset training columns }
+# use the classe + the predictor columns as a filter
+colsToUse <- c("classe", predCandidates)
+# get a list of the 
+filteredTraining <- origTraining[, colsToUse, with=FALSE]
+# make classe a factor
+filteredTraining <- filteredTraining[, classe := factor(filteredTraining[, classe])]
+#filteredTraining[, .N, classe]
+#dim(filteredTraining)
+#names(filteredTraining)
+```
+
+##  split 60/40 training/test datasets
+```{r split into training and test datasets}
+# start date as seed.  Note the seed can cause small shift submitted answers
+set.seed(160615)   
+# partition the test data in to test and probe sets
+inTrain <- createDataPartition(filteredTraining$classe, p=0.6, list=FALSE)
+Train <- filteredTraining[inTrain,]
+Probe <- filteredTraining[-inTrain,]
+```
+
+## Preprocess training dataset
+```{r Preprocess training dataset}
+trainPred <- Train[, predCandidates, with=FALSE]
+# center and scale the data
+preProc <- preProcess(trainPred, method=c("center", "scale"))
+#preProc
+tempCentScale <- predict(preProc, trainPred)
+trainCentScale <- data.table(data.frame(classe = Train[, classe], tempCentScale))
+```
+
+## preprocess Probect dataset
+```{r preprocess test dataset}
+probePred <- Probe[, predCandidates, with=FALSE]
+tempCentScale <- predict(preProc, probePred)
+probeCentScale <- data.table(data.frame(classe = Probe[, classe], tempCentScale))
+```
+
+## Check for unique predictors
+
+Check to see if there are predictors with near 0 variance indicating 
+they are un-informative and will likely break the prediction or at least skew the mode.
+Therefore we should be remove them
+See http://www.r-bloggers.com/near-zero-variance-predictors-should-we-remove-them/
+```{r check near 0 variance}
+nzvPredictors <- nearZeroVar(trainCentScale, saveMetrics=TRUE)
+if (any(nzvPredictors$nzv)) {
+  message(paste("ERROR - near zero values in Predictors.  Check ", nzvPredictors$nzv)) 
+} else  {
+  message("No near 0 variance predictors.  Good to go!!")
+}
+```
+
+## Examime the predictors - REMOVE THIS!!!
+
+```{r examing predictors}
+histGroup <- function (data, regex) {
+  col <- grep(regex, names(data))
+  col <- c(col, which(names(data) == "classe"))
+  require(reshape2)
+  n <- nrow(data)
+  DMelted <- melt(data[, col, with=FALSE][, rownum := seq(1, n)], id.vars=c("rownum", "classe"))
+  require(ggplot2)
+  ggplot(DMelted, aes(x=classe, y=value)) +
+    geom_violin(aes(color=classe, fill=classe), alpha=1/2) +
+    facet_wrap(~ variable, scale="free_y") +
+    scale_color_brewer(palette="Spectral") +
+    scale_fill_brewer(palette="Spectral") +
+    labs(x="", y="") +
+    theme(legend.position="none")
+}
+histGroup(trainCentScale, "belt")
+histGroup(trainCentScale, "[^(fore)]arm")
+histGroup(trainCentScale, "dumbbell")
+histGroup(trainCentScale, "forearm")
+```
+
+
+## Train the model
+
+Enable Parallel clustering (assumes multiple cores)
+```{r Train Model}
+# Enable parallel processing to make training faster
+require(parallel)
+require(doParallel)
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+```
+Train the model
+```{r train the model}
+system.time( trainingModel  <- train(classe ~ ., data=trainCentScale, method="rf"))
+```
+Terminate parallel processing
+```{r terminate parallel}
+stopCluster(cl)
+```
+
+## Save the training model to disk
+Since it takes a long time to build this training model, we save it to disk so we can by pass the training steps if we want.
+```{r Write training model to disk}
+trainingFile <- "trainingModel.Rdata"
+save(trainingModel, file=trainingFile)
+```
+
+#Restore training model from disk
+```{r load training model from file }
+load(trainingFile)
+```
+
+
+## Evaluate the model on training set  ?? REMOVE
+```{r evaluate mode vs training set }
+hatTrain <- predict(trainingModel, trainCentScale)
+confusionMatrix(hatTrain, trainCentScale[, classe])
+```
+
+## Evaluate the model on test set  ?? REMOVE
+```{r evaluate mode vs test set }
+hatTrain <- predict(trainingModel, probeCentScale)
+confusionMatrix(hatTrain, probeCentScale[, classe])
+```
+
+## Display Model
+```{r Display Model}
+varImp(trainingModel)
+trainingModel$finalModel
+```
+
+## Predict with test data 
+```{r Predict with test data}
+testPred <- predict(preProc, DTest[, predCandidates, with=FALSE])
+hat <- predict(trainingModel, testPred)
+DTest <- cbind(hat , DTest)
+subset(DTest, select=names(DTest)[grep("belt|[^(fore)]arm|dumbbell|forearm", names(DTest), invert=TRUE)])
+```
+
+```{r write answer files}
+# Write submission answer files to send to Coursera using the provided function
+pml_write_files = function(x){
+  n = length(x)
+  path <- "./answers"
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=file.path(path, filename),quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+pml_write_files(hat)
+```
